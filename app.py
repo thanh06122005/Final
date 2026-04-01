@@ -62,18 +62,27 @@ def first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None
 
 
 def normalize_raw_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize common _x/_y suffixes from merged notebook outputs."""
+    """Normalize common _x/_y/_raw suffixes from merged notebook outputs."""
     rename_map = {}
     for base in [
+        "CustomerID",
         "Tenure Months",
         "Contract",
+        "Internet Service",
         "Monthly Charges",
+        "Payment Method",
+        "Latitude",
+        "Longitude",
+        "CLTV",
         "Churn Label",
+        "Churn",
     ]:
         if f"{base}_x" in df.columns and base not in df.columns:
             rename_map[f"{base}_x"] = base
         if f"{base}_y" in df.columns and base not in df.columns:
             rename_map[f"{base}_y"] = base
+        if f"{base}_raw" in df.columns and base not in df.columns:
+            rename_map[f"{base}_raw"] = base
     if rename_map:
         df = df.rename(columns=rename_map)
     return df
@@ -96,30 +105,41 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     churn = pd.read_csv(CHURN_FILE)
     raw = pd.read_csv(RAW_FILE)
+    churn = normalize_raw_columns(churn)
     raw = normalize_raw_columns(raw)
 
     # Make sure key numeric columns are numeric
-    for col in ["Monthly Charges", "Total Charges", "CLTV", "Latitude", "Longitude"]:
+    for col in ["Monthly Charges", "Total Charges", "CLTV", "Latitude", "Longitude", "Churn_Probability"]:
         if col in churn.columns:
             churn[col] = pd.to_numeric(churn[col], errors="coerce")
+    for col in ["Monthly Charges", "Total Charges", "CLTV", "Latitude", "Longitude"]:
         if col in raw.columns:
             raw[col] = pd.to_numeric(raw[col], errors="coerce")
 
-    # Merge to get geography + display columns
-    df = churn.merge(
-        raw[[c for c in [
-            "CustomerID", "Latitude", "Longitude", "Gender", "Senior Citizen", "Churn"
-        ] if c in raw.columns]],
-        on="CustomerID",
-        how="left",
-        suffixes=("", "_raw"),
-    )
+    # Bring in the notebook columns that are needed for charts + simulator.
+    raw_cols = [
+        "CustomerID", "Contract", "Internet Service", "Monthly Charges", "Tenure Months",
+        "Payment Method", "City", "Zip Code", "Latitude", "Longitude", "Gender",
+        "Senior Citizen", "Churn", "Churn Label", "CLTV", "Charges Band", "Churn Reason"
+    ]
+    raw_cols = [c for c in raw_cols if c in raw.columns]
 
-    # Prefer clean labels from churn file; fall back to raw if needed
-    if "Churn" not in df.columns and "Churn_raw" in df.columns:
-        df["Churn"] = df["Churn_raw"]
-    if "Churn Label" not in df.columns and "Churn Label_raw" in df.columns:
-        df["Churn Label"] = df["Churn Label_raw"]
+    df = churn.merge(raw[raw_cols], on="CustomerID", how="left", suffixes=("", "_raw"))
+    df = normalize_raw_columns(df)
+
+    # Fill missing important fields from raw columns if they still exist only as suffixed versions
+    for base in ["Contract", "Internet Service", "Monthly Charges", "Tenure Months", "Payment Method", "Latitude", "Longitude", "CLTV", "Churn Label", "Churn"]:
+        if base not in df.columns:
+            for suffix in ["_raw", "_x", "_y"]:
+                alt = f"{base}{suffix}"
+                if alt in df.columns:
+                    df[base] = df[alt]
+                    break
+        elif df[base].isna().any():
+            for suffix in ["_raw", "_x", "_y"]:
+                alt = f"{base}{suffix}"
+                if alt in df.columns:
+                    df[base] = df[base].fillna(df[alt])
 
     return df, raw
 
@@ -216,11 +236,11 @@ with st.sidebar:
 # -----------------------------
 # Shared columns
 # -----------------------------
-contract_col = first_existing_column(df, ["Contract"])
-internet_col = first_existing_column(df, ["Internet Service"])
-monthly_col = first_existing_column(df, ["Monthly Charges"])
-churn_col = first_existing_column(df, ["Churn"])
-label_col = first_existing_column(df, ["Churn Label"])
+contract_col = first_existing_column(df, ["Contract", "Contract_x", "Contract_y", "Contract_raw"])
+internet_col = first_existing_column(df, ["Internet Service", "Internet Service_x", "Internet Service_y", "Internet Service_raw"])
+monthly_col = first_existing_column(df, ["Monthly Charges", "Monthly Charges_x", "Monthly Charges_y", "Monthly Charges_raw"])
+churn_col = first_existing_column(df, ["Churn", "Churn_x", "Churn_y", "Churn_raw"])
+label_col = first_existing_column(df, ["Churn Label", "Churn Label_x", "Churn Label_y", "Churn Label_raw"])
 
 # -----------------------------
 # Dashboard tab
@@ -311,32 +331,58 @@ if page == "📊 Overview Dashboard":
 
     with col5:
         st.subheader("Geographic Churn Map — California")
-        if {"Latitude", "Longitude"}.issubset(df.columns):
-            geo = df.dropna(subset=["Latitude", "Longitude"])
-            geo = geo[geo["Latitude"].between(32, 42) & geo["Longitude"].between(-125, -114)]
+        lat_col = first_existing_column(df, ["Latitude", "Latitude_x", "Latitude_y", "Latitude_raw"])
+        lon_col = first_existing_column(df, ["Longitude", "Longitude_x", "Longitude_y", "Longitude_raw"])
+        if lat_col and lon_col:
+            geo = df.dropna(subset=[lat_col, lon_col]).copy()
+            geo[lat_col] = pd.to_numeric(geo[lat_col], errors="coerce")
+            geo[lon_col] = pd.to_numeric(geo[lon_col], errors="coerce")
+            geo = geo[geo[lat_col].between(32, 42) & geo[lon_col].between(-125, -114)]
+
             if len(geo):
-                fig5 = px.scatter_mapbox(
-                    geo,
-                    lat="Latitude",
-                    lon="Longitude",
-                    color="Churn_Probability",
-                    size=monthly_col if monthly_col else None,
-                    color_continuous_scale=["#66BB6A", "#FFA726", "#EF5350"],
-                    range_color=[0, 1],
-                    size_max=10,
-                    zoom=5,
-                    height=300,
-                    hover_data={
-                        "CustomerID": True,
-                        "Churn_Probability": ":.3f",
-                        "Risk_Tier": True,
-                        "Monthly Charges": ":.0f" if monthly_col else False,
-                        "Latitude": False,
-                        "Longitude": False,
-                    },
-                    mapbox_style="open-street-map",
-                )
-                fig5.update_layout(margin=dict(t=5, b=0), paper_bgcolor="rgba(0,0,0,0)")
+                hover_data = {"CustomerID": True, "Churn_Probability": ":.3f", "Risk_Tier": True}
+                if monthly_col and monthly_col in geo.columns:
+                    geo[monthly_col] = pd.to_numeric(geo[monthly_col], errors="coerce")
+                    hover_data[monthly_col] = ":.0f"
+                if contract_col and contract_col in geo.columns:
+                    hover_data[contract_col] = True
+                if internet_col and internet_col in geo.columns:
+                    hover_data[internet_col] = True
+
+                try:
+                    fig5 = px.scatter_mapbox(
+                        geo,
+                        lat=lat_col,
+                        lon=lon_col,
+                        color="Churn_Probability",
+                        size=monthly_col if monthly_col and monthly_col in geo.columns else None,
+                        color_continuous_scale=["#66BB6A", "#FFA726", "#EF5350"],
+                        range_color=[0, 1],
+                        size_max=10,
+                        zoom=5,
+                        height=300,
+                        hover_data=hover_data,
+                        mapbox_style="open-street-map",
+                    )
+                    fig5.update_layout(margin=dict(t=5, b=0), paper_bgcolor="rgba(0,0,0,0)")
+                except Exception:
+                    # Fallback that does not depend on Mapbox.
+                    fig5 = px.scatter_geo(
+                        geo,
+                        lat=lat_col,
+                        lon=lon_col,
+                        color="Churn_Probability",
+                        size=monthly_col if monthly_col and monthly_col in geo.columns else None,
+                        color_continuous_scale=["#66BB6A", "#FFA726", "#EF5350"],
+                        range_color=[0, 1],
+                        size_max=10,
+                        hover_data=hover_data,
+                        projection="albers usa",
+                        height=300,
+                    )
+                    fig5.update_geos(fitbounds="locations", visible=False)
+                    fig5.update_layout(margin=dict(t=5, b=0), paper_bgcolor="rgba(0,0,0,0)")
+
                 st.plotly_chart(fig5, use_container_width=True)
             else:
                 st.info("No California coordinates after filtering.")
@@ -394,7 +440,7 @@ else:
                 0, 100, 50, 10,
                 help="% of churned target customers that the strategy saves",
             )
-            n_sim = st.select_slider("🎲 Simulations", options=[200, 500, 1000], value=500)
+            n_sim = st.select_slider("🎲 Monte Carlo runs", options=[200, 500, 1000], value=500, help="More runs = stabler results, but slower runtime.")
             strategy_desc = st.text_input("📝 Strategy Name", placeholder="e.g. 10% discount for month-to-month high-risk fiber customers")
 
         submitted = st.form_submit_button("🚀 Run Simulation", type="primary", use_container_width=True)
