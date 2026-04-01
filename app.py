@@ -200,6 +200,39 @@ def make_risk_ordered_counts(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_target_mask(
+    df: pd.DataFrame,
+    contract_col: str | None,
+    internet_col: str | None,
+    target_contracts: list[str],
+    target_risks: list[str],
+    target_internet: list[str],
+) -> pd.Series:
+    mask = pd.Series(True, index=df.index)
+    if target_contracts and contract_col and contract_col in df.columns:
+        mask &= df[contract_col].isin(target_contracts)
+    if target_risks and "Risk_Tier" in df.columns:
+        mask &= df["Risk_Tier"].isin(target_risks)
+    if target_internet and internet_col and internet_col in df.columns:
+        mask &= df[internet_col].isin(target_internet)
+    return mask
+
+
+def estimate_discount_cost(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    monthly_col: str | None,
+    price_change_pct: float,
+) -> float:
+    if monthly_col is None or monthly_col not in df.columns or price_change_pct >= 0:
+        return 0.0
+    monthly_vals = pd.to_numeric(df.loc[mask, monthly_col], errors="coerce").dropna()
+    if monthly_vals.empty:
+        return 0.0
+    discount_rate = abs(price_change_pct) / 100.0
+    return float(monthly_vals.mean() * mask.sum() * discount_rate)
+
+
 # -----------------------------
 # Load data
 # -----------------------------
@@ -454,8 +487,10 @@ else:
         retention_rate: float,
         n_sim: int,
     ):
-        if not {"Churn_Probability", "Monthly Charges", "Risk_Tier"}.issubset(base_df.columns):
-            raise ValueError("Missing required columns in base data.")
+        required = {"Churn_Probability", "Monthly Charges", "Risk_Tier"}
+        if not required.issubset(base_df.columns):
+            missing = ", ".join(sorted(required - set(base_df.columns)))
+            raise ValueError(f"Missing required columns in base data: {missing}")
 
         charge_band_elasticity = {
             "Low (<$35)": 0.8,
@@ -465,13 +500,17 @@ else:
         }
 
         base = base_df.copy()
-        mask = pd.Series(True, index=base.index)
-        if target_contracts and contract_col:
-            mask &= base[contract_col].isin(target_contracts)
-        if target_risks:
-            mask &= base["Risk_Tier"].isin(target_risks)
-        if target_internet and internet_col:
-            mask &= base[internet_col].isin(target_internet)
+        base["Churn_Probability"] = pd.to_numeric(base["Churn_Probability"], errors="coerce").fillna(0).clip(0, 1)
+        base["Monthly Charges"] = pd.to_numeric(base["Monthly Charges"], errors="coerce").fillna(0)
+
+        mask = build_target_mask(
+            base,
+            contract_col,
+            internet_col,
+            target_contracts,
+            target_risks,
+            target_internet,
+        )
 
         n_targeted = int(mask.sum())
         if n_targeted == 0:
@@ -484,43 +523,38 @@ else:
 
         rng = np.random.default_rng(42)
         targeted_idx = np.where(mask.values)[0]
+        monthly = base["Monthly Charges"].to_numpy(dtype=float)
+        probs = base["Churn_Probability"].to_numpy(dtype=float)
 
-        # Baseline and strategy scenarios run side by side
         for _ in range(n_sim):
-            # Baseline sample
-            base_churn = rng.binomial(1, base["Churn_Probability"].to_numpy())
-            base_rev = base.loc[base_churn == 0, "Monthly Charges"].sum()
+            base_churn = rng.binomial(1, probs)
+            base_rev = float(monthly[base_churn == 0].sum())
 
-            # Strategy sample
-            strat = base.copy()
+            strat_monthly = monthly.copy()
+            strat_probs = probs.copy()
+
             if price_change_pct != 0:
-                strat.loc[mask, "Monthly Charges"] *= (1 + price_change_pct / 100)
-                if "Charges Band" in strat.columns:
-                    adjusted = []
-                    for _, row in strat.iterrows():
-                        elasticity = charge_band_elasticity.get(row.get("Charges Band", "Medium ($35-65)"), 0.5)
-                        p = row["Churn_Probability"] * (1 + (price_change_pct / 100) * elasticity)
-                        adjusted.append(float(np.clip(p, 0, 1)))
-                    strat["Churn_Probability"] = adjusted
+                strat_monthly[mask.values] = strat_monthly[mask.values] * (1 + price_change_pct / 100.0)
+                if "Charges Band" in base.columns:
+                    bands = base["Charges Band"].fillna("Medium ($35-65)").astype(str)
+                    for i, band in enumerate(bands):
+                        elasticity = charge_band_elasticity.get(band, 0.5)
+                        strat_probs[i] = np.clip(strat_probs[i] * (1 + (price_change_pct / 100.0) * elasticity), 0, 1)
                 else:
-                    strat["Churn_Probability"] = np.clip(
-                        strat["Churn_Probability"] * (1 + (price_change_pct / 100) * 0.4),
-                        0,
-                        1,
-                    )
+                    strat_probs = np.clip(strat_probs * (1 + (price_change_pct / 100.0) * 0.4), 0, 1)
 
-            strat_churn = rng.binomial(1, strat["Churn_Probability"].to_numpy())
+            strat_churn = rng.binomial(1, strat_probs)
 
-            # Retention: save a fraction of churned targeted customers
             if retention_rate > 0:
                 churned_target = np.array([idx for idx in targeted_idx if strat_churn[idx] == 1])
                 if len(churned_target) > 0:
-                    retain_n = int(len(churned_target) * (retention_rate / 100))
+                    retain_n = int(round(len(churned_target) * (retention_rate / 100.0)))
+                    retain_n = max(0, min(retain_n, len(churned_target)))
                     if retain_n > 0:
                         saved_idx = rng.choice(churned_target, retain_n, replace=False)
                         strat_churn[saved_idx] = 0
 
-            strat_rev = strat.loc[strat_churn == 0, "Monthly Charges"].sum()
+            strat_rev = float(strat_monthly[strat_churn == 0].sum())
 
             base_revenues.append(base_rev)
             strat_revenues.append(strat_rev)
@@ -529,10 +563,10 @@ else:
 
         return {
             "n_targeted": n_targeted,
-            "base_revenues": np.array(base_revenues),
-            "strat_revenues": np.array(strat_revenues),
-            "base_churns": np.array(base_churns),
-            "strat_churns": np.array(strat_churns),
+            "base_revenues": np.array(base_revenues, dtype=float),
+            "strat_revenues": np.array(strat_revenues, dtype=float),
+            "base_churns": np.array(base_churns, dtype=int),
+            "strat_churns": np.array(strat_churns, dtype=int),
         }, None
 
     if not submitted:
@@ -552,18 +586,23 @@ else:
             st.error("Please select at least one option in each filter.")
             st.stop()
 
-        sim_result, err = run_strategy_simulation(
-            base_df=df,
-            target_contracts=target_contract,
-            target_risks=target_risk,
-            target_internet=target_internet,
-            price_change_pct=price_change_pct,
-            retention_rate=retention_rate,
-            n_sim=n_sim,
-        )
+        with st.spinner("Running Monte Carlo simulation..."):
+            sim_result, err = run_strategy_simulation(
+                base_df=df,
+                target_contracts=target_contract,
+                target_risks=target_risk,
+                target_internet=target_internet,
+                price_change_pct=price_change_pct,
+                retention_rate=retention_rate,
+                n_sim=n_sim,
+            )
 
         if err:
             st.error(err)
+            st.stop()
+
+        if sim_result is None:
+            st.error("Simulation did not return results.")
             st.stop()
 
         n_targeted = sim_result["n_targeted"]
@@ -572,15 +611,17 @@ else:
         base_churns = sim_result["base_churns"]
         strat_churns = sim_result["strat_churns"]
 
-        b_rev = base_revenues.mean()
-        s_rev = strat_revenues.mean()
-        b_ch = base_churns.mean()
-        s_ch = strat_churns.mean()
+        if len(base_revenues) == 0 or len(strat_revenues) == 0:
+            st.error("Simulation returned empty results.")
+            st.stop()
+
+        b_rev = float(base_revenues.mean())
+        s_rev = float(strat_revenues.mean())
+        b_ch = float(base_churns.mean())
+        s_ch = float(strat_churns.mean())
         uplift = s_rev - b_rev
         saved = b_ch - s_ch
-        cost = n_targeted * df.loc[df.index.isin(np.where(
-            df[contract_col].isin(target_contract) & df["Risk_Tier"].isin(target_risk) & df[internet_col].isin(target_internet)
-        )[0]), monthly_col].mean() * max(0, -price_change_pct / 100) if monthly_col and price_change_pct < 0 else 0
+        cost = estimate_discount_cost(df, build_target_mask(df, contract_col, internet_col, target_contract, target_risk, target_internet), monthly_col, price_change_pct)
         roi = (uplift / cost * 100) if cost and cost > 0 else float("inf")
 
         if strategy_desc:
@@ -636,7 +677,7 @@ else:
         disc_range = [-20, -15, -10, -5, 0, 5, 10, 15, 20]
         u_mean, u_p5, u_p95 = [], [], []
         for d in disc_range:
-            sim, _ = run_strategy_simulation(
+            sim, err2 = run_strategy_simulation(
                 base_df=df,
                 target_contracts=target_contract,
                 target_risks=target_risk,
@@ -645,6 +686,11 @@ else:
                 retention_rate=retention_rate,
                 n_sim=min(200, n_sim),
             )
+            if err2 or sim is None:
+                u_mean.append(0.0)
+                u_p5.append(0.0)
+                u_p95.append(0.0)
+                continue
             upl = sim["strat_revenues"] - sim["base_revenues"]
             u_mean.append(float(upl.mean()))
             u_p5.append(float(np.percentile(upl, 5)))
